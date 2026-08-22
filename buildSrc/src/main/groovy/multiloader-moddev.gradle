@@ -1,0 +1,33 @@
+configurations.all {
+    resolutionStrategy.cacheDynamicVersionsFor(1, "seconds")
+}
+
+def accessTransformer = project(":common").file('src/main/resources/META-INF/accesstransformer.cfg')
+
+neoForge {
+    version = findProperty("neoforge_version") ?: "21.1.77"
+    if (accessTransformer.exists()) {
+        accessTransformers.from(accessTransformer.absolutePath)
+    }
+    mods {
+        "${mod_id}" {
+            sourceSet(sourceSets.main)
+        }
+    }
+    runs {
+        client {
+            client()
+            systemProperty 'neoforge.enabledGameTestNamespaces', project.mod_id
+        }
+        server {
+            server()
+            systemProperty 'neoforge.enabledGameTestNamespaces', project.mod_id
+            programArgument '--nogui'
+        }
+    }
+}
+
+def generatedResources = project(":common").file('src/generated/resources')
+if (generatedResources.exists()) {
+    sourceSets.main.resources { srcDir generatedResources.getAbsolutePath() }
+}

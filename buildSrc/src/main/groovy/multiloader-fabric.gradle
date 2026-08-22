@@ -1,0 +1,32 @@
+dependencies {
+    minecraft "com.mojang:minecraft:${minecraft_version}"
+    mappings loom.layered() {
+        officialMojangMappings()
+        def pMc = findProperty("parchment_minecraft") ?: "1.21"
+        def pVer = findProperty("parchment_version") ?: "2024.11.10"
+        parchment("org.parchmentmc.data:parchment-${pMc}:${pVer}@zip")
+    }
+    modImplementation "net.fabricmc:fabric-loader:${findProperty('fabric_loader_version') ?: '0.16.9'}"
+    modImplementation "net.fabricmc.fabric-api:fabric-api:${findProperty('fabric_version') ?: '0.110.0+1.21.1'}"
+}
+
+loom {
+    def aw = project(":common").file("src/main/resources/${mod_id}.accesswidener")
+    if (aw.exists()) {
+        accessWidenerPath.set(aw)
+    }
+    runs {
+        client {
+            client()
+            setConfigName("Fabric Client")
+            ideConfigGenerated(true)
+            runDir("runs/client")
+        }
+        server {
+            server()
+            setConfigName("Fabric Server")
+            ideConfigGenerated(true)
+            runDir("runs/server")
+        }
+    }
+}

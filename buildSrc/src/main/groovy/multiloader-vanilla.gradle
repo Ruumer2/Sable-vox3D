@@ -1,0 +1,28 @@
+def accessTransformer = file('src/main/resources/META-INF/accesstransformer.cfg')
+
+neoForge {
+    neoFormVersion = findProperty("neo_form_version") ?: "1.21.1-20240808.144430"
+    if (accessTransformer.exists()) {
+        accessTransformers.from(accessTransformer.absolutePath)
+    }
+    parchment {
+        minecraftVersion = findProperty("parchment_minecraft") ?: "1.21"
+        mappingsVersion = findProperty("parchment_version") ?: "2024.11.10"
+    }
+}
+
+configurations {
+    commonJava {
+        canBeResolved = false
+        canBeConsumed = true
+    }
+    commonResources {
+        canBeResolved = false
+        canBeConsumed = true
+    }
+}
+
+artifacts {
+    commonJava sourceSets.main.java.sourceDirectories.singleFile
+    commonResources sourceSets.main.resources.sourceDirectories.singleFile
+}

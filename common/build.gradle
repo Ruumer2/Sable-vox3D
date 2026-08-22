@@ -1,0 +1,19 @@
+plugins {
+    id 'multiloader-common'
+    id 'net.neoforged.moddev'
+    id 'multiloader-vanilla'
+}
+
+repositories {
+    mavenCentral()
+    maven { url = uri("https://maven.fabricmc.net/") }
+    maven { url = uri("https://maven.neoforged.net/releases") }
+    maven { url = uri("https://maven.ryanhcode.dev/releases") }
+}
+
+dependencies {
+    compileOnly 'org.spongepowered:mixin:0.8.7'
+    compileOnly 'io.github.llamalad7:mixinextras-common:0.4.1'
+    annotationProcessor 'io.github.llamalad7:mixinextras-common:0.4.1'
+    compileOnly "dev.ryanhcode.sable:sable-common-${minecraft_version}:${sable_version}"
+}

@@ -1,0 +1,23 @@
+plugins {
+    id 'multiloader-loader'
+    id 'net.neoforged.moddev'
+    id 'multiloader-moddev'
+}
+
+repositories {
+    mavenCentral()
+    maven { url = uri("https://maven.neoforged.net/releases") }
+    maven { url = uri("https://maven.ryanhcode.dev/releases") }
+    maven { url = uri("https://maven.blamejared.com") }
+    maven { url = uri("https://maven.parchmentmc.org") }
+    maven { url = uri("https://maven.createmod.net") }
+    maven { url = uri("https://mvn.devos.one/snapshots/") }
+    maven { url = uri("https://mvn.devos.one/releases/") }
+    maven { url = uri("https://maven.tterrag.com") }
+    maven { url = uri("https://cursemaven.com") }
+    maven { url = uri("https://maven.firstdarkdev.xyz/snapshots") }
+}
+
+dependencies {
+    implementation "dev.ryanhcode.sable:sable-neoforge-${minecraft_version}:${sable_version}"
+}

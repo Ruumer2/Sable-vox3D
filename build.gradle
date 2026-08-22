@@ -1,0 +1,39 @@
+def nativeSourceDir = file('native').exists() ? file('native') : (file('natives').exists() ? file('natives') : file('native'))
+def nativeBuildDir = new File(nativeSourceDir, 'build')
+
+def configureNativeRelease = tasks.register('configureNativeRelease', Exec) {
+    group = 'build'
+    description = 'Configures the platform-native Vox3D bridge.'
+    inputs.file(new File(nativeSourceDir, 'CMakeLists.txt'))
+    outputs.file(new File(nativeBuildDir, 'CMakeCache.txt'))
+    commandLine 'cmake', '-S', nativeSourceDir.absolutePath, '-B', nativeBuildDir.absolutePath,
+            '-DCMAKE_BUILD_TYPE=Release'
+}
+
+def buildNativeRelease = tasks.register('buildNativeRelease', Exec) {
+    group = 'build'
+    description = 'Builds and copies the platform-native Vox3D bridge into common resources.'
+    dependsOn configureNativeRelease
+    inputs.files(fileTree(nativeSourceDir) {
+        exclude 'build/**'
+        exclude '.git/**'
+    }).withPropertyName("nativeSourceFiles")
+    outputs.dir(file('common/src/main/resources/natives')).withPropertyName("nativeResourceDir")
+    commandLine 'cmake', '--build', nativeBuildDir.absolutePath, '--config', 'Release',
+            '--target', 'package_sable_vox3d_native'
+}
+
+gradle.projectsEvaluated {
+    [project(':common'), project(':fabric'), project(':neoforge')].each { targetProject ->
+        targetProject.tasks.matching { it.name in ['processResources', 'sourcesJar', 'jar'] }.configureEach {
+            dependsOn(buildNativeRelease)
+        }
+    }
+}
+
+tasks.register('releaseBuild') {
+    group = 'build'
+    description = 'Builds the current native bridge before packaging both loader jars.'
+    dependsOn buildNativeRelease, ':fabric:build', ':neoforge:build'
+}
+

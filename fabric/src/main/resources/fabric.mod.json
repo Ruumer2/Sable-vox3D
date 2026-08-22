@@ -1,0 +1,25 @@
+{
+  "schemaVersion": 1,
+  "id": "sable_vox3d",
+  "version": "${version}",
+  "name": "${mod_name}",
+  "description": "${description}",
+  "authors": [
+    "${mod_author}"
+  ],
+  "contact": {},
+  "license": "${license}",
+  "environment": "*",
+  "entrypoints": {
+    "main": [
+      "dev.ryanhcode.sable.physics.impl.vox3d.fabric.SableVox3DFabric"
+    ]
+  },
+  "depends": {
+    "fabricloader": ">=${fabric_loader_version}",
+    "minecraft": "${minecraft_version}",
+    "java": ">=${java_version}",
+    "fabric-api": "*",
+    "sable": ">=${sable_min_version} <3.0.0"
+  }
+}

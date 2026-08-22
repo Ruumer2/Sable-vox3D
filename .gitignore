@@ -1,0 +1,132 @@
+# ==============================================================================
+# Gradle & Java Build Outputs
+# ==============================================================================
+.gradle/
+build/
+**/build/
+out/
+bin/
+*.class
+
+# Allow Gradle wrapper jar
+*.jar
+!gradle/wrapper/gradle-wrapper.jar
+*.war
+*.ear
+*.nar
+
+# Java crash / replay logs
+hs_err_pid*
+replay_pid*
+
+# ==============================================================================
+# Minecraft & ModDev / Loom Runtime Directories
+# ==============================================================================
+# Mod testing run environments
+run/
+**/run/
+run-*/
+runs/
+
+# Minecraft runtime data
+*.lck
+*.log
+logs/
+**/logs/
+crash-reports/
+**/crash-reports/
+saves/
+**/saves/
+options.txt
+optionsshaders.txt
+optionsof.txt
+command_history.txt
+usercache.json
+usernamecache.json
+hotbar.nbt
+realms_persistence.json
+
+# ModDev / Fabric Loom caches
+.fabric/
+fabric-loom/
+.mixin.out/
+moddev/
+.package-state
+
+# ==============================================================================
+# Native / CMake Build Outputs (C / C++ Bridge)
+# ==============================================================================
+native/build/
+**/native/build/
+cmake-build-*/
+CMakeUserPresets.json
+CMakeSettings.json
+.fetchcontent-cache/
+.vs/
+
+# Native object and binary artifacts
+*.obj
+*.o
+*.lib
+*.a
+*.pdb
+*.idb
+*.ilk
+*.exp
+*.pch
+*.res
+*.tlog
+
+# Vox3D test recordings / local config
+*.b3rec
+imgui.ini
+settings.ini
+
+# ==============================================================================
+# IDEs and Editors
+# ==============================================================================
+# IntelliJ IDEA
+.idea/
+*.iml
+*.iws
+*.ipr
+.idea_modules/
+
+# Visual Studio Code
+.vscode/
+*.code-workspace
+
+# Eclipse
+.eclipse/
+.classpath
+.project
+.settings/
+
+# Fleet / Sublime / Vim
+.fleet/
+*.sublime-project
+*.sublime-workspace
+*.swp
+*~
+
+# ==============================================================================
+# Scratch & Local Development Scripts
+# ==============================================================================
+scratch/
+*.tmp
+*.bak
+
+# ==============================================================================
+# Operating System Files
+# ==============================================================================
+# macOS
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+
+# Windows
+Thumbs.db
+ehthumbs.db
+desktop.ini
