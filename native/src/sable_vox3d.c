@@ -39,13 +39,28 @@ typedef struct {
     double max[3];
 } VoxelBox;
 
+#define MAX_QUEUED_BLOCK_COLLISIONS 256
+
+typedef struct {
+    jobject callback;
+    int x, y, z;
+    int otherX, otherY, otherZ;
+    b3Pos impactPosition;
+    double impactVelocity;
+    bool hasOtherBlock;
+} QueuedBlockCollision;
+
 typedef struct {
     int id;
     float friction;
     float volume;
     float restitution;
     bool isFluid;
+    bool hasAirfoil;
+    b3Airfoil airfoil;
     jobject callback;
+    bool removesCollision;
+    double triggerVelocity;
     VoxelBox* boxes;
     int boxCount;
     int boxCapacity;
@@ -80,7 +95,9 @@ typedef struct {
     int id;
     int mountId;
     b3BodyId bodyId;
+    b3JointId mountFilterJointId;
     bool ownsBody;
+    bool hasValidTransform;
     double centerOfMass[3];
     // For a mounted contraption this is the collider pose relative to the
     // parent sub-level rigid body, matching Rapier's position_wrt_parent. Keep
@@ -209,6 +226,10 @@ typedef struct {
     float aeroLift;
     float maxAeroSpeed;
 
+    QueuedBlockCollision queuedBlockCollisions[MAX_QUEUED_BLOCK_COLLISIONS];
+    int queuedBlockCollisionCount;
+    vox_mutex_t collisionQueueMutex;
+
     vox_mutex_t mutex;
 } Vox3DScene;
 
@@ -260,6 +281,7 @@ static void invalidate_body_dependents(Vox3DScene* scene, int bodyId);
 static void apply_constraint_pd_motors(Vox3DScene* scene, Vox3DConstraint* constraint, double timeStep, int motorAxesMask);
 static void apply_rotary_constraint_motor(Vox3DScene* scene, Vox3DConstraint* constraint, double timeStep);
 static KinematicContraption* find_contraption(Vox3DScene* scene, int id);
+static void sync_contraption_mount_filter(Vox3DScene* scene, KinematicContraption* con);
 static KinematicContraptionShape* get_contraption_shape_data(b3ShapeId shapeId);
 static VoxelColliderDef* lookup_contraption_collision_block(
     Vox3DScene* scene, KinematicContraptionShape* shape, b3Pos point,
@@ -268,6 +290,8 @@ static b3Vec3 get_contraption_fake_world_velocity(
     Vox3DScene* scene, KinematicContraptionShape* shape, b3Pos point);
 static b3BodyId get_rope_mount_body(Vox3DScene* scene, const Vox3DRope* rope, bool end);
 static b3Vec3 get_rope_mount_anchor(Vox3DScene* scene, const Vox3DRope* rope, bool end);
+static b3Vec3 axis_for_index(int axis);
+static int single_axis_index(int mask);
 static void destroy_rope_world_anchor(Vox3DRope* rope, bool end);
 
 static inline b3Quat make_safe_quat(double x, double y, double z, double w) {
@@ -501,53 +525,92 @@ static VoxelColliderDef* lookup_collision_block(
     return &g_voxelColliders[colliderId - 1];
 }
 
-static bool invoke_block_callback(
-    JNIEnv* env, VoxelColliderDef* def,
+static void queue_block_collision(
+    Vox3DScene* scene, VoxelColliderDef* def,
     int x, int y, int z, int otherX, int otherY, int otherZ,
     b3Pos impactPosition, double impactVelocity, bool hasOtherBlock)
 {
-    if (!def || !def->callback) return false;
+    if (!scene || !def || !def->callback) return;
 
-    jclass callbackClass = (*env)->GetObjectClass(env, def->callback);
-    if (!callbackClass) {
-        (*env)->ExceptionClear(env);
-        return false;
+    VOX_MUTEX_LOCK(scene->collisionQueueMutex);
+    for (int i = 0; i < scene->queuedBlockCollisionCount; i++) {
+        QueuedBlockCollision* existing = &scene->queuedBlockCollisions[i];
+        if (existing->callback == def->callback &&
+            existing->x == x && existing->y == y && existing->z == z) {
+            VOX_MUTEX_UNLOCK(scene->collisionQueueMutex);
+            return;
+        }
     }
-    jmethodID method = (*env)->GetMethodID(env, callbackClass, "onCollision", "(IIIIIIDDDDZ)[D");
-    if (!method) {
-        (*env)->ExceptionClear(env);
+    if (scene->queuedBlockCollisionCount < MAX_QUEUED_BLOCK_COLLISIONS) {
+        QueuedBlockCollision* item = &scene->queuedBlockCollisions[scene->queuedBlockCollisionCount++];
+        item->callback = def->callback;
+        item->x = x;
+        item->y = y;
+        item->z = z;
+        item->otherX = otherX;
+        item->otherY = otherY;
+        item->otherZ = otherZ;
+        item->impactPosition = impactPosition;
+        item->impactVelocity = impactVelocity;
+        item->hasOtherBlock = hasOtherBlock;
+    }
+    VOX_MUTEX_UNLOCK(scene->collisionQueueMutex);
+}
+
+static void dispatch_queued_block_collisions(JNIEnv* env, Vox3DScene* scene)
+{
+    if (!scene || !env) return;
+
+    VOX_MUTEX_LOCK(scene->collisionQueueMutex);
+    int count = scene->queuedBlockCollisionCount;
+    if (count == 0) {
+        VOX_MUTEX_UNLOCK(scene->collisionQueueMutex);
+        return;
+    }
+
+    QueuedBlockCollision localQueue[MAX_QUEUED_BLOCK_COLLISIONS];
+    memcpy(localQueue, scene->queuedBlockCollisions, count * sizeof(QueuedBlockCollision));
+    scene->queuedBlockCollisionCount = 0;
+    VOX_MUTEX_UNLOCK(scene->collisionQueueMutex);
+
+    for (int i = 0; i < count; i++) {
+        QueuedBlockCollision* item = &localQueue[i];
+        if (!item->callback) continue;
+
+        jclass callbackClass = (*env)->GetObjectClass(env, item->callback);
+        if (!callbackClass) {
+            (*env)->ExceptionClear(env);
+            continue;
+        }
+        jmethodID method = (*env)->GetMethodID(env, callbackClass, "onCollision", "(IIIIIIDDDDZ)[D");
+        if (!method) {
+            (*env)->ExceptionClear(env);
+            (*env)->DeleteLocalRef(env, callbackClass);
+            continue;
+        }
+
+        jdoubleArray result = (jdoubleArray)(*env)->CallObjectMethod(
+            env, item->callback, method,
+            (jint)item->x, (jint)item->y, (jint)item->z,
+            (jint)item->otherX, (jint)item->otherY, (jint)item->otherZ,
+            (jdouble)item->impactPosition.x, (jdouble)item->impactPosition.y, (jdouble)item->impactPosition.z,
+            (jdouble)item->impactVelocity, (jboolean)(item->hasOtherBlock ? JNI_TRUE : JNI_FALSE));
+
+        if ((*env)->ExceptionCheck(env)) {
+            (*env)->ExceptionClear(env);
+        }
+        if (result) {
+            (*env)->DeleteLocalRef(env, result);
+        }
         (*env)->DeleteLocalRef(env, callbackClass);
-        return false;
     }
-
-    jdoubleArray result = (jdoubleArray)(*env)->CallObjectMethod(
-        env, def->callback, method,
-        (jint)x, (jint)y, (jint)z,
-        (jint)otherX, (jint)otherY, (jint)otherZ,
-        (jdouble)impactPosition.x, (jdouble)impactPosition.y, (jdouble)impactPosition.z,
-        (jdouble)impactVelocity, (jboolean)(hasOtherBlock ? JNI_TRUE : JNI_FALSE));
-
-    bool removeCollision = false;
-    if ((*env)->ExceptionCheck(env)) {
-        (*env)->ExceptionClear(env);
-    } else if (result && (*env)->GetArrayLength(env, result) >= 4) {
-        jdouble values[4];
-        (*env)->GetDoubleArrayRegion(env, result, 0, 4, values);
-        // Box3D's pre-solve hook can keep or remove a contact, but it has no
-        // equivalent for Sable/Rapier's per-contact tangent velocity result.
-        removeCollision = values[3] != 0.0;
-    }
-
-    if (result) (*env)->DeleteLocalRef(env, result);
-    (*env)->DeleteLocalRef(env, callbackClass);
-    return removeCollision;
 }
 
 static bool vox_pre_solve_callback(
     b3ShapeId shapeIdA, b3ShapeId shapeIdB, b3Pos point, b3Vec3 normal, void* context)
 {
     Vox3DScene* scene = (Vox3DScene*)context;
-    if (!scene || !g_javaVm) return true;
+    if (!scene) return true;
 
     b3BodyId bodyA = b3Shape_GetBody(shapeIdA);
     b3BodyId bodyB = b3Shape_GetBody(shapeIdB);
@@ -579,24 +642,28 @@ static bool vox_pre_solve_callback(
         get_contraption_fake_world_velocity(scene, contraptionShapeB, point));
     double impactVelocity = fmax(0.0, (double)b3Dot(b3Sub(velocityA, velocityB), normal));
 
-    JNIEnv* env = NULL;
-    bool attached = false;
-    jint status = (*g_javaVm)->GetEnv(g_javaVm, (void**)&env, JNI_VERSION_1_8);
-    if (status == JNI_EDETACHED) {
-        if ((*g_javaVm)->AttachCurrentThread(g_javaVm, (void**)&env, NULL) != JNI_OK) return true;
-        attached = true;
-    } else if (status != JNI_OK) {
-        return true;
+    bool removeCollision = false;
+
+    if (defA && defA->callback) {
+        if (impactVelocity >= defA->triggerVelocity) {
+            queue_block_collision(scene, defA, ax, ay, az, bx, by, bz, impactA, impactVelocity,
+                contraptionShapeB != NULL || (subB != NULL && subB->isVoxelSubLevel));
+            if (defA->removesCollision) {
+                removeCollision = true;
+            }
+        }
     }
 
-    bool removeCollision = invoke_block_callback(
-        env, defA, ax, ay, az, bx, by, bz, impactA, impactVelocity,
-        contraptionShapeB != NULL || (subB != NULL && subB->isVoxelSubLevel));
-    removeCollision |= invoke_block_callback(
-        env, defB, bx, by, bz, ax, ay, az, impactB, impactVelocity,
-        contraptionShapeA != NULL || (subA != NULL && subA->isVoxelSubLevel));
+    if (defB && defB->callback) {
+        if (impactVelocity >= defB->triggerVelocity) {
+            queue_block_collision(scene, defB, bx, by, bz, ax, ay, az, impactB, impactVelocity,
+                contraptionShapeA != NULL || (subA != NULL && subA->isVoxelSubLevel));
+            if (defB->removesCollision) {
+                removeCollision = true;
+            }
+        }
+    }
 
-    if (attached) (*g_javaVm)->DetachCurrentThread(g_javaVm);
     return !removeCollision;
 }
 
@@ -663,7 +730,9 @@ static KinematicContraption* alloc_contraption(Vox3DScene* scene, int id) {
             scene->contraptions[i].valid = true;
             scene->contraptions[i].mountId = -1;
             scene->contraptions[i].bodyId = b3_nullBodyId;
+            scene->contraptions[i].mountFilterJointId = b3_nullJointId;
             scene->contraptions[i].poseRotation = b3Quat_identity;
+            scene->contraptions[i].hasValidTransform = false;
             return &scene->contraptions[i];
         }
     }
@@ -685,7 +754,9 @@ static KinematicContraption* alloc_contraption(Vox3DScene* scene, int id) {
     scene->contraptions[idx].valid = true;
     scene->contraptions[idx].mountId = -1;
     scene->contraptions[idx].bodyId = b3_nullBodyId;
+    scene->contraptions[idx].mountFilterJointId = b3_nullJointId;
     scene->contraptions[idx].poseRotation = b3Quat_identity;
+    scene->contraptions[idx].hasValidTransform = false;
     return &scene->contraptions[idx];
 }
 
@@ -720,48 +791,15 @@ static bool ensure_contraption_shape_capacity(KinematicContraption* con, int req
     return true;
 }
 
-static b3Vec3 get_contraption_shape_velocity(const KinematicContraption* con,
-                                              const KinematicContraptionShape* shape) {
-    b3Vec3 localCenter = {
-        (float)(shape->sourceCenter[0] - con->centerOfMass[0]),
-        (float)(shape->sourceCenter[1] - con->centerOfMass[1]),
-        (float)(shape->sourceCenter[2] - con->centerOfMass[2])
-    };
-    b3Vec3 localLinear = {
-        (float)con->linearVelocity[0],
-        (float)con->linearVelocity[1],
-        (float)con->linearVelocity[2]
-    };
-    b3Vec3 localAngular = {
-        (float)con->angularVelocity[0],
-        (float)con->angularVelocity[1],
-        (float)con->angularVelocity[2]
-    };
-    b3Vec3 velocity = b3Add(localLinear, b3Cross(localAngular, localCenter));
-    return b3RotateVector(con->poseRotation, velocity);
-}
-
 static b3Transform get_contraption_shape_transform(const KinematicContraption* con,
                                                     const KinematicContraptionShape* shape) {
     b3Transform transform = b3Transform_identity;
-    b3Vec3 localCenter = {
+    transform.p = (b3Vec3){
         (float)(shape->sourceCenter[0] - con->centerOfMass[0]),
         (float)(shape->sourceCenter[1] - con->centerOfMass[1]),
         (float)(shape->sourceCenter[2] - con->centerOfMass[2])
     };
-
-    if (con->ownsBody) {
-        transform.p = localCenter;
-        return transform;
-    }
-
-    b3Vec3 rotatedCenter = b3RotateVector(con->poseRotation, localCenter);
-    transform.p = (b3Vec3){
-        (float)(con->posePosition[0] + (double)rotatedCenter.x),
-        (float)(con->posePosition[1] + (double)rotatedCenter.y),
-        (float)(con->posePosition[2] + (double)rotatedCenter.z)
-    };
-    transform.q = con->poseRotation;
+    transform.q = b3Quat_identity;
     return transform;
 }
 
@@ -784,12 +822,6 @@ static b3ShapeId create_contraption_shape(KinematicContraption* con,
     shapeDef.enableHitEvents = true;
     shapeDef.enablePreSolveEvents = true;
     shapeDef.updateBodyMass = false;
-    if (!con->ownsBody) {
-        // Box exposes only a constant conveyor/surface velocity per hull. A
-        // block-sized sample at the hull center is a close approximation of
-        // Rapier's point-dependent fake linear/angular velocity.
-        shapeDef.baseMaterial.tangentVelocity = get_contraption_shape_velocity(con, shape);
-    }
     return b3CreateHullShape(con->bodyId, &shapeDef, &boxHull.base);
 }
 
@@ -813,25 +845,69 @@ static void rebuild_contraption_shapes(KinematicContraption* con) {
     for (int i = 0; i < con->shapeCount; i++) {
         con->shapes[i].shapeId = create_contraption_shape(con, &con->shapes[i]);
     }
-    if (!con->ownsBody) b3Body_SetAwake(con->bodyId, true);
+    b3Body_SetAwake(con->bodyId, true);
+}
+
+static void sync_contraption_mount_filter(Vox3DScene* scene, KinematicContraption* con) {
+    if (!con || !con->valid) return;
+
+    if (con->mountId == -1 || !b3Body_IsValid(con->bodyId)) {
+        if (b3Joint_IsValid(con->mountFilterJointId)) {
+            b3Joint_SetCollideConnected(con->mountFilterJointId, true);
+            b3DestroyJoint(con->mountFilterJointId, false);
+            con->mountFilterJointId = b3_nullJointId;
+        }
+        return;
+    }
+
+    SubLevelBody* mount = find_sublevel(scene, con->mountId);
+    if (!mount || !mount->valid || !b3Body_IsValid(mount->bodyId)) {
+        if (b3Joint_IsValid(con->mountFilterJointId)) {
+            b3Joint_SetCollideConnected(con->mountFilterJointId, true);
+            b3DestroyJoint(con->mountFilterJointId, false);
+            con->mountFilterJointId = b3_nullJointId;
+        }
+        return;
+    }
+
+    if (b3Joint_IsValid(con->mountFilterJointId)) {
+        return;
+    }
+
+    b3FilterJointDef def = b3DefaultFilterJointDef();
+    def.base.bodyIdA = mount->bodyId;
+    def.base.bodyIdB = con->bodyId;
+    def.base.collideConnected = false;
+    con->mountFilterJointId = b3CreateFilterJoint(scene->worldId, &def);
+    if (b3Joint_IsValid(con->mountFilterJointId)) {
+        b3Joint_SetCollideConnected(con->mountFilterJointId, false);
+    }
 }
 
 static void release_contraption(Vox3DScene* scene, KinematicContraption* con,
                                 bool invalidateDependents, bool parentBeingDestroyed) {
+    (void)parentBeingDestroyed;
     if (!con) return;
     if (invalidateDependents) invalidate_body_dependents(scene, con->id);
 
-    destroy_contraption_shapes(con, !con->ownsBody && !parentBeingDestroyed);
+    if (b3Joint_IsValid(con->mountFilterJointId)) {
+        b3Joint_SetCollideConnected(con->mountFilterJointId, true);
+        b3DestroyJoint(con->mountFilterJointId, false);
+        con->mountFilterJointId = b3_nullJointId;
+    }
+
+    destroy_contraption_shapes(con, false);
     free(con->shapes);
     con->shapes = NULL;
     con->shapeCount = 0;
     con->shapeCapacity = 0;
 
-    if (con->ownsBody && b3Body_IsValid(con->bodyId)) {
+    if (b3Body_IsValid(con->bodyId)) {
         b3DestroyBody(con->bodyId);
     }
     con->bodyId = b3_nullBodyId;
     con->ownsBody = false;
+    con->hasValidTransform = false;
     con->valid = false;
 }
 
@@ -842,16 +918,7 @@ static KinematicContraptionShape* get_contraption_shape_data(b3ShapeId shapeId) 
 
 static b3Vec3 get_contraption_local_point(const KinematicContraption* con, b3Pos point) {
     b3WorldTransform bodyTransform = b3Body_GetTransform(con->bodyId);
-    b3Vec3 bodyLocal = b3InvTransformWorldPoint(bodyTransform, point);
-    if (con->ownsBody) return bodyLocal;
-
-    b3Vec3 posePosition = {
-        (float)con->posePosition[0],
-        (float)con->posePosition[1],
-        (float)con->posePosition[2]
-    };
-    return b3InvRotateVector(
-        con->poseRotation, b3Sub(bodyLocal, posePosition));
+    return b3InvTransformWorldPoint(bodyTransform, point);
 }
 
 static b3Pos get_contraption_logical_point(const KinematicContraption* con, b3Pos point) {
@@ -885,23 +952,9 @@ static b3Vec3 get_contraption_fake_world_velocity(
 {
     if (!shape) return b3Vec3_zero;
     KinematicContraption* con = find_contraption(scene, shape->contraptionId);
-    if (!con || con->ownsBody || !b3Body_IsValid(con->bodyId)) return b3Vec3_zero;
+    if (!con || !b3Body_IsValid(con->bodyId)) return b3Vec3_zero;
 
-    b3Vec3 localPoint = get_contraption_local_point(con, point);
-    b3Vec3 linear = {
-        (float)con->linearVelocity[0],
-        (float)con->linearVelocity[1],
-        (float)con->linearVelocity[2]
-    };
-    b3Vec3 angular = {
-        (float)con->angularVelocity[0],
-        (float)con->angularVelocity[1],
-        (float)con->angularVelocity[2]
-    };
-    b3Vec3 localVelocity = b3Add(linear, b3Cross(angular, localPoint));
-    b3Vec3 bodyLocalVelocity = b3RotateVector(con->poseRotation, localVelocity);
-    b3WorldTransform bodyTransform = b3Body_GetTransform(con->bodyId);
-    return b3RotateVector(bodyTransform.q, bodyLocalVelocity);
+    return b3Body_GetWorldPointVelocity(con->bodyId, point);
 }
 
 static Vox3DConstraint* find_constraint(Vox3DScene* scene, int64_t handle) {
@@ -1083,9 +1136,7 @@ static void invalidate_body_dependents(Vox3DScene* scene, int bodyId) {
 static void release_mounted_contraptions(Vox3DScene* scene, int mountId) {
     for (int i = 0; i < scene->contraptionCount; i++) {
         KinematicContraption* con = &scene->contraptions[i];
-        if (!con->valid || con->ownsBody || con->mountId != mountId) continue;
-        // These hulls are children of the parent body. Remove them before the
-        // parent disappears, but never destroy the shared parent body here.
+        if (!con->valid || con->mountId != mountId) continue;
         release_contraption(scene, con, true, true);
     }
 }
@@ -1158,6 +1209,26 @@ static void rebuild_sublevel_shapes(Vox3DScene* scene, SubLevelBody* sub) {
                             double ly = (double)wy - sub->centerOfMass[1];
                             double lz = (double)wz - sub->centerOfMass[2];
 
+                            bool isInterior = true;
+                            if (bx == 0 || bx == 15 || by == 0 || by == 15 || bz == 0 || bz == 15) {
+                                isInterior = false;
+                            } else {
+                                static const int neighborOffsets[6] = { 1, -1, 16, -16, 256, -256 };
+                                for (int k = 0; k < 6; k++) {
+                                    int nPacked = node->data[idx + neighborOffsets[k]];
+                                    int nColliderId = (nPacked >> 16) & 0xFFFF;
+                                    if (nColliderId <= 0 || nColliderId > g_voxelColliderCount) {
+                                        isInterior = false;
+                                        break;
+                                    }
+                                    VoxelColliderDef* ndef = &g_voxelColliders[nColliderId - 1];
+                                    if (ndef->isFluid || ndef->boxCount == 0) {
+                                        isInterior = false;
+                                        break;
+                                    }
+                                }
+                            }
+
                             for (int bi = 0; bi < def->boxCount; bi++) {
                                 VoxelBox* vb = &def->boxes[bi];
                                 float hx = (float)((vb->max[0] - vb->min[0]) * 0.5);
@@ -1178,6 +1249,10 @@ static void rebuild_sublevel_shapes(Vox3DScene* scene, SubLevelBody* sub) {
                                 sDef.enableHitEvents = true;
                                 sDef.enablePreSolveEvents = true;
                                 sDef.updateBodyMass = false;
+                                sDef.enableLift = (!isInterior || def->hasAirfoil);
+                                if (def->hasAirfoil) {
+                                    sDef.airfoil = def->airfoil;
+                                }
 
                                 b3ShapeId sId = b3CreateHullShape(sub->bodyId, &sDef, &boxHull.base);
 
@@ -1224,6 +1299,8 @@ JNIEXPORT jlong JNICALL Java_dev_ryanhcode_sable_physics_impl_vox3d_Vox3D_initia
     if (!scene) return 0;
 
     VOX_MUTEX_INIT(scene->mutex);
+    VOX_MUTEX_INIT(scene->collisionQueueMutex);
+    scene->queuedBlockCollisionCount = 0;
     scene->gravity[0] = gx;
     scene->gravity[1] = gy;
     scene->gravity[2] = gz;
@@ -1234,13 +1311,16 @@ JNIEXPORT jlong JNICALL Java_dev_ryanhcode_sable_physics_impl_vox3d_Vox3D_initia
     scene->minIslandSize = 128;
 
     scene->wind = b3Vec3_zero;
-    scene->aeroDrag = 1.0f;
-    scene->aeroLift = 1.2f;
+    scene->aeroDrag = 0.5f;
+    scene->aeroLift = 80.0f;
     scene->maxAeroSpeed = 50.0f;
 
     b3WorldDef worldDef = b3DefaultWorldDef();
     b3Vec3 g = { (float)gx, (float)gy, (float)gz };
     worldDef.gravity = g;
+    worldDef.wind = scene->wind;
+    worldDef.aeroDrag = scene->aeroDrag;
+    worldDef.aeroLift = scene->aeroLift;
     worldDef.enableContinuous = true;
     worldDef.enableSleep = true;
     worldDef.workerCount = 4;
@@ -1320,8 +1400,10 @@ JNIEXPORT void JNICALL Java_dev_ryanhcode_sable_physics_impl_vox3d_Vox3D_dispose
     }
     VOX_MUTEX_UNLOCK(scene->mutex);
     VOX_MUTEX_DESTROY(scene->mutex);
+    VOX_MUTEX_DESTROY(scene->collisionQueueMutex);
     free(scene);
 }
+
 
 JNIEXPORT void JNICALL Java_dev_ryanhcode_sable_physics_impl_vox3d_Vox3D_tick(
     JNIEnv *env, jclass clazz, jlong sceneHandle, jdouble timeStep)
@@ -1366,8 +1448,29 @@ JNIEXPORT void JNICALL Java_dev_ryanhcode_sable_physics_impl_vox3d_Vox3D_step(
         if (constraint->type == 2) {
             apply_constraint_pd_motors(scene, constraint, timeStep, 0x3F);
         } else if (constraint->type == 3) {
-            apply_constraint_pd_motors(scene, constraint, timeStep,
-                (~constraint->lockedAxesMask) & 0x3F);
+            int unconstrainedAxes = 0;
+            if (constraint->jointKind == 1) {
+                unconstrainedAxes = 0; // weld locks all
+            } else if (constraint->jointKind == 2) {
+                // spherical locks linear (0,1,2), angular (3,4,5) are free on joint
+                unconstrainedAxes = 0x38;
+            } else if (constraint->jointKind == 3) {
+                // revolute locks all linear and 2 angular, only 1 angular free
+                int freeAngularAxis = single_axis_index((~((constraint->lockedAxesMask >> 3) & 0x7)) & 0x7);
+                if (freeAngularAxis >= 0) {
+                    unconstrainedAxes = (1 << (freeAngularAxis + 3));
+                }
+            } else if (constraint->jointKind == 4) {
+                // prismatic locks all angular and 2 linear, only 1 linear free
+                int freeLinearAxis = single_axis_index((~(constraint->lockedAxesMask & 0x7)) & 0x7);
+                if (freeLinearAxis >= 0) {
+                    unconstrainedAxes = (1 << freeLinearAxis);
+                }
+            } else {
+                // No joint in Box3D: all 6 axes are unconstrained by native joint
+                unconstrainedAxes = 0x3F;
+            }
+            apply_constraint_pd_motors(scene, constraint, timeStep, unconstrainedAxes);
         } else if (constraint->type == 1) {
             apply_rotary_constraint_motor(scene, constraint, timeStep);
         }
@@ -1415,13 +1518,48 @@ JNIEXPORT void JNICALL Java_dev_ryanhcode_sable_physics_impl_vox3d_Vox3D_step(
     if (isfinite(timeStep) && timeStep > 0.0) {
         for (int i = 0; i < scene->contraptionCount; i++) {
             KinematicContraption* con = &scene->contraptions[i];
-            if (!con->valid || !con->ownsBody || !b3Body_IsValid(con->bodyId)) continue;
+            if (!con->valid || !b3Body_IsValid(con->bodyId)) continue;
 
-            b3WorldTransform target = {
-                { con->posePosition[0], con->posePosition[1], con->posePosition[2] },
-                con->poseRotation
-            };
-            b3Body_SetTargetTransform(con->bodyId, target, (float)timeStep, true);
+            sync_contraption_mount_filter(scene, con);
+
+            b3WorldTransform target;
+            if (con->mountId != -1) {
+                SubLevelBody* mount = find_sublevel(scene, con->mountId);
+                if (mount && b3Body_IsValid(mount->bodyId)) {
+                    b3WorldTransform mountTransform = b3Body_GetTransform(mount->bodyId);
+                    b3Vec3 relPos = { (float)con->posePosition[0], (float)con->posePosition[1], (float)con->posePosition[2] };
+                    b3Vec3 worldPosOffset = b3RotateVector(mountTransform.q, relPos);
+                    target.p = (b3Pos){
+                        mountTransform.p.x + (double)worldPosOffset.x,
+                        mountTransform.p.y + (double)worldPosOffset.y,
+                        mountTransform.p.z + (double)worldPosOffset.z
+                    };
+                    target.q = b3MulQuat(mountTransform.q, con->poseRotation);
+                } else {
+                    target.p = (b3Pos){ con->posePosition[0], con->posePosition[1], con->posePosition[2] };
+                    target.q = con->poseRotation;
+                }
+            } else {
+                target.p = (b3Pos){ con->posePosition[0], con->posePosition[1], con->posePosition[2] };
+                target.q = con->poseRotation;
+            }
+            if (!isfinite(target.p.x) || !isfinite(target.p.y) || !isfinite(target.p.z)) {
+                target.p = (b3Pos){ 0.0, 0.0, 0.0 };
+            }
+            target.q = make_safe_quat(target.q.v.x, target.q.v.y, target.q.v.z, target.q.s);
+
+            b3WorldTransform currentXf = b3Body_GetTransform(con->bodyId);
+            b3Vec3 deltaP = b3SubPos(target.p, currentXf.p);
+            float distSqr = b3Dot(deltaP, deltaP);
+
+            if (!con->hasValidTransform || distSqr > 25.0f) {
+                b3Body_SetTransform(con->bodyId, target.p, target.q);
+                b3Body_SetLinearVelocity(con->bodyId, b3Vec3_zero);
+                b3Body_SetAngularVelocity(con->bodyId, b3Vec3_zero);
+                con->hasValidTransform = true;
+            } else {
+                b3Body_SetTargetTransform(con->bodyId, target, (float)timeStep, true);
+            }
         }
     }
 
@@ -1502,6 +1640,7 @@ JNIEXPORT void JNICALL Java_dev_ryanhcode_sable_physics_impl_vox3d_Vox3D_step(
     }
 
     VOX_MUTEX_UNLOCK(scene->mutex);
+    dispatch_queued_block_collisions(env, scene);
 }
 
 JNIEXPORT void JNICALL Java_dev_ryanhcode_sable_physics_impl_vox3d_Vox3D_createSubLevel(
@@ -1520,8 +1659,8 @@ JNIEXPORT void JNICALL Java_dev_ryanhcode_sable_physics_impl_vox3d_Vox3D_createS
     bodyDef.type = b3_dynamicBody;
     bodyDef.position = (b3Pos){ pose[0], pose[1], pose[2] };
     bodyDef.rotation = make_safe_quat(pose[3], pose[4], pose[5], pose[6]);
-    bodyDef.linearDamping = (float)scene->universalDrag;
-    bodyDef.angularDamping = (float)scene->universalDrag;
+    bodyDef.linearDamping = 0.0f;
+    bodyDef.angularDamping = 0.005f;
     bodyDef.isBullet = true;
     bodyDef.allowFastRotation = true;
     bodyDef.enableContactRecycling = false;
@@ -1594,8 +1733,8 @@ JNIEXPORT void JNICALL Java_dev_ryanhcode_sable_physics_impl_vox3d_Vox3D_createB
     bodyDef.type = b3_dynamicBody;
     bodyDef.position = (b3Pos){ pose[0], pose[1], pose[2] };
     bodyDef.rotation = make_safe_quat(pose[3], pose[4], pose[5], pose[6]);
-    bodyDef.linearDamping = (float)scene->universalDrag;
-    bodyDef.angularDamping = (float)scene->universalDrag;
+    bodyDef.linearDamping = 0.0f;
+    bodyDef.angularDamping = 0.005f;
 
     b3BodyId bodyId = b3CreateBody(scene->worldId, &bodyDef);
 
@@ -1604,6 +1743,7 @@ JNIEXPORT void JNICALL Java_dev_ryanhcode_sable_physics_impl_vox3d_Vox3D_createB
     shapeDef.baseMaterial.friction = 0.5f;
     shapeDef.enableHitEvents = true;
     shapeDef.enablePreSolveEvents = true;
+    shapeDef.enableLift = false;
 
     b3BoxHull boxHull = b3MakeBoxHull((float)hx, (float)hy, (float)hz);
     b3ShapeId shapeId = b3CreateHullShape(bodyId, &shapeDef, &boxHull.base);
@@ -1915,9 +2055,9 @@ JNIEXPORT void JNICALL Java_dev_ryanhcode_sable_physics_impl_vox3d_Vox3D_changeB
 
 JNIEXPORT jint JNICALL Java_dev_ryanhcode_sable_physics_impl_vox3d_Vox3D_newVoxelCollider(
     JNIEnv *env, jclass clazz, jdouble friction, jdouble volume, jdouble restitution,
-    jboolean isFluid, jobject callback)
+    jboolean isFluid, jobject callback, jboolean removesCollision, jdouble triggerVelocity)
 {
-    (void)env; (void)clazz; (void)callback;
+    (void)clazz;
     ensure_global_mutex();
     VOX_MUTEX_LOCK(g_globalMutex);
 
@@ -1934,12 +2074,52 @@ JNIEXPORT jint JNICALL Java_dev_ryanhcode_sable_physics_impl_vox3d_Vox3D_newVoxe
     def->restitution = (float)restitution;
     def->isFluid = isFluid ? true : false;
     def->callback = callback ? (*env)->NewGlobalRef(env, callback) : NULL;
+    def->removesCollision = removesCollision ? true : false;
+    def->triggerVelocity = triggerVelocity;
     def->boxes = NULL;
     def->boxCount = 0;
     def->boxCapacity = 0;
+    def->hasAirfoil = false;
+    def->airfoil = b3DefaultAirfoil();
 
     VOX_MUTEX_UNLOCK(g_globalMutex);
     return idx;
+}
+
+JNIEXPORT void JNICALL Java_dev_ryanhcode_sable_physics_impl_vox3d_Vox3D_setVoxelColliderAirfoil(
+    JNIEnv *env, jclass clazz, jint index, jint airfoilType,
+    jdouble chordX, jdouble chordY, jdouble chordZ,
+    jdouble upX, jdouble upY, jdouble upZ,
+    jdouble area, jdouble aspectRatio)
+{
+    (void)env; (void)clazz;
+    ensure_global_mutex();
+    VOX_MUTEX_LOCK(g_globalMutex);
+    if (index >= 0 && index < g_voxelColliderCount) {
+        VoxelColliderDef* def = &g_voxelColliders[index];
+        if (airfoilType <= 0) {
+            def->hasAirfoil = false;
+            def->airfoil = b3DefaultAirfoil();
+        } else {
+            b3Vec3 chord = { (float)chordX, (float)chordY, (float)chordZ };
+            b3Vec3 up = { (float)upX, (float)upY, (float)upZ };
+            float a = (float)area;
+            float ar = (float)aspectRatio;
+            if (airfoilType == 1) {
+                def->airfoil = b3MakeFlatPlateAirfoil(chord, up, a, ar);
+            } else if (airfoilType == 2) {
+                def->airfoil = b3MakeSymmetricAirfoil(chord, up, a, ar);
+            } else if (airfoilType == 3) {
+                def->airfoil = b3MakeCamberedAirfoil(chord, up, a, ar);
+            } else if (airfoilType == 5) {
+                def->airfoil = b3MakeNaca4412Airfoil(chord, up, a, ar);
+            } else {
+                def->airfoil = b3DefaultAirfoil();
+            }
+            def->hasAirfoil = true;
+        }
+    }
+    VOX_MUTEX_UNLOCK(g_globalMutex);
 }
 
 JNIEXPORT void JNICALL Java_dev_ryanhcode_sable_physics_impl_vox3d_Vox3D_addVoxelColliderBox(
@@ -1985,6 +2165,8 @@ JNIEXPORT void JNICALL Java_dev_ryanhcode_sable_physics_impl_vox3d_Vox3D_clearVo
     VOX_MUTEX_LOCK(g_globalMutex);
     if (index >= 0 && index < g_voxelColliderCount) {
         g_voxelColliders[index].boxCount = 0;
+        g_voxelColliders[index].hasAirfoil = false;
+        g_voxelColliders[index].airfoil = b3DefaultAirfoil();
     }
     VOX_MUTEX_UNLOCK(g_globalMutex);
 }
@@ -2476,15 +2658,22 @@ static void apply_constraint_pd_motors(
 {
     memset(c->impulses, 0, sizeof(c->impulses));
 
-    bool hasMotor = false;
+    bool hasWork = false;
     for (int axis = 0; axis < 6; axis++) {
-        if ((motorAxesMask & (1 << axis)) != 0 && c->motorConfigured[axis] &&
-            (c->motorStiffness[axis] > 0.0 || c->motorDamping[axis] > 0.0)) {
-            hasMotor = true;
-            break;
+        if ((motorAxesMask & (1 << axis)) != 0) {
+            bool isLocked = (c->type == 3) && ((c->lockedAxesMask & (1 << axis)) != 0);
+            if (isLocked) {
+                hasWork = true;
+                break;
+            }
+            if (c->motorConfigured[axis] &&
+                (c->motorStiffness[axis] > 0.0 || c->motorDamping[axis] > 0.0)) {
+                hasWork = true;
+                break;
+            }
         }
     }
-    if (!hasMotor) return;
+    if (!hasWork) return;
 
     b3BodyId bodyA = get_constraint_body(scene, c, false);
     b3BodyId bodyB = get_constraint_body(scene, c, true);
@@ -2530,24 +2719,44 @@ static void apply_constraint_pd_motors(
             (axis == 1 ? b3Vec3_axisY : b3Vec3_axisZ);
         b3Vec3 worldAxis = b3RotateVector(frameRotationA, localAxis);
 
-        if ((motorAxesMask & (1 << axis)) != 0 && c->motorConfigured[axis]) {
-            double acceleration = implicit_motor_acceleration(
-                c->motorTarget[axis] - linearPositionValues[axis],
-                linearVelocityValues[axis],
-                c->motorStiffness[axis], c->motorDamping[axis], timeStep);
-            double output = linear_motor_effective_mass(
-                bodyA, bodyB, worldAnchorA, worldAnchorB, worldAxis) * acceleration;
-            forceComponents[axis] = (float)clamp_motor_output(c, axis, output);
+        if ((motorAxesMask & (1 << axis)) != 0) {
+            bool isLocked = (c->type == 3) && ((c->lockedAxesMask & (1 << axis)) != 0);
+            if (isLocked) {
+                double acceleration = implicit_motor_acceleration(
+                    -linearPositionValues[axis], linearVelocityValues[axis],
+                    1.0e6, 2.0e3, timeStep);
+                double output = linear_motor_effective_mass(
+                    bodyA, bodyB, worldAnchorA, worldAnchorB, worldAxis) * acceleration;
+                forceComponents[axis] = (float)output;
+            } else if (c->motorConfigured[axis]) {
+                double acceleration = implicit_motor_acceleration(
+                    c->motorTarget[axis] - linearPositionValues[axis],
+                    linearVelocityValues[axis],
+                    c->motorStiffness[axis], c->motorDamping[axis], timeStep);
+                double output = linear_motor_effective_mass(
+                    bodyA, bodyB, worldAnchorA, worldAnchorB, worldAxis) * acceleration;
+                forceComponents[axis] = (float)clamp_motor_output(c, axis, output);
+            }
         }
 
         int angularIndex = axis + 3;
-        if ((motorAxesMask & (1 << angularIndex)) != 0 && c->motorConfigured[angularIndex]) {
-            double acceleration = implicit_motor_acceleration(
-                wrapped_motor_error(c->motorTarget[angularIndex], angularPositionValues[axis]),
-                angularVelocityValues[axis], c->motorStiffness[angularIndex],
-                c->motorDamping[angularIndex], timeStep);
-            double output = angular_motor_effective_mass(bodyA, bodyB, worldAxis) * acceleration;
-            torqueComponents[axis] = (float)clamp_motor_output(c, angularIndex, output);
+        if ((motorAxesMask & (1 << angularIndex)) != 0) {
+            bool isLocked = (c->type == 3) && ((c->lockedAxesMask & (1 << angularIndex)) != 0);
+            if (isLocked) {
+                double acceleration = implicit_motor_acceleration(
+                    wrapped_motor_error(0.0, angularPositionValues[axis]),
+                    angularVelocityValues[axis],
+                    1.0e6, 2.0e3, timeStep);
+                double output = angular_motor_effective_mass(bodyA, bodyB, worldAxis) * acceleration;
+                torqueComponents[axis] = (float)output;
+            } else if (c->motorConfigured[angularIndex]) {
+                double acceleration = implicit_motor_acceleration(
+                    wrapped_motor_error(c->motorTarget[angularIndex], angularPositionValues[axis]),
+                    angularVelocityValues[axis], c->motorStiffness[angularIndex],
+                    c->motorDamping[angularIndex], timeStep);
+                double output = angular_motor_effective_mass(bodyA, bodyB, worldAxis) * acceleration;
+                torqueComponents[axis] = (float)clamp_motor_output(c, angularIndex, output);
+            }
         }
     }
 
@@ -2836,14 +3045,7 @@ static int single_axis_index(int mask) {
 }
 
 static bool generic_mask_supported(int mask) {
-    mask &= 0x3F;
-    int linearMask = mask & 0x7;
-    int angularMask = (mask >> 3) & 0x7;
-
-    // Empty, ball/socket (optionally locking one or two angular axes), weld,
-    // and slider configurations have exact Box3D equivalents.
-    if (mask == 0 || linearMask == 0x7) return true;
-    return angularMask == 0x7 && single_axis_index((~linearMask) & 0x7) >= 0;
+    return (mask & ~0x3F) == 0;
 }
 
 static void rebuild_generic_joint(Vox3DScene* scene, Vox3DConstraint* c) {
@@ -3310,34 +3512,37 @@ JNIEXPORT void JNICALL Java_dev_ryanhcode_sable_physics_impl_vox3d_Vox3D_createK
         con->centerOfMass[0] = 0.0;
         con->centerOfMass[1] = 0.0;
         con->centerOfMass[2] = 0.0;
+        con->mountFilterJointId = b3_nullJointId;
+        con->hasValidTransform = false;
 
-        if (mountId == -1) {
-            b3BodyDef bodyDef = b3DefaultBodyDef();
-            bodyDef.type = b3_kinematicBody;
-            bodyDef.position = (b3Pos){ pose[0], pose[1], pose[2] };
-            bodyDef.rotation = rotation;
-            con->bodyId = b3CreateBody(scene->worldId, &bodyDef);
-            con->ownsBody = true;
-        } else {
+        b3BodyDef bodyDef = b3DefaultBodyDef();
+        bodyDef.type = b3_kinematicBody;
+
+        b3Pos initialPos = (b3Pos){ pose[0], pose[1], pose[2] };
+        b3Quat initialRot = rotation;
+
+        if (mountId != -1) {
             SubLevelBody* mount = find_sublevel(scene, mountId);
-            if (!mount || !b3Body_IsValid(mount->bodyId)) {
-                con->valid = false;
-            } else {
-                // The hulls are created directly on the dynamic parent. This
-                // makes contacts affect the ship instead of an independent
-                // infinite-mass kinematic body.
-                con->bodyId = mount->bodyId;
-                con->ownsBody = false;
-                // createKinematicContraption receives the logical position;
-                // subsequent updates are already COM-relative on the Java
-                // side. Normalize the initial pose here as well so a perfectly
-                // stationary contraption is correct even when no first update
-                // crosses the upload threshold.
-                con->posePosition[0] -= mount->centerOfMass[0];
-                con->posePosition[1] -= mount->centerOfMass[1];
-                con->posePosition[2] -= mount->centerOfMass[2];
+            if (mount && b3Body_IsValid(mount->bodyId)) {
+                b3WorldTransform mountTransform = b3Body_GetTransform(mount->bodyId);
+                b3Vec3 relPos = { (float)pose[0], (float)pose[1], (float)pose[2] };
+                b3Vec3 worldPosOffset = b3RotateVector(mountTransform.q, relPos);
+                initialPos = (b3Pos){
+                    mountTransform.p.x + (double)worldPosOffset.x,
+                    mountTransform.p.y + (double)worldPosOffset.y,
+                    mountTransform.p.z + (double)worldPosOffset.z
+                };
+                initialRot = b3MulQuat(mountTransform.q, rotation);
+                con->hasValidTransform = true;
             }
         }
+
+        bodyDef.position = initialPos;
+        bodyDef.rotation = initialRot;
+        con->bodyId = b3CreateBody(scene->worldId, &bodyDef);
+        con->ownsBody = true;
+
+        sync_contraption_mount_filter(scene, con);
     }
 
     VOX_MUTEX_UNLOCK(scene->mutex);
@@ -3354,6 +3559,25 @@ JNIEXPORT void JNICALL Java_dev_ryanhcode_sable_physics_impl_vox3d_Vox3D_removeK
     KinematicContraption* con = find_contraption(scene, id);
     if (con) {
         release_contraption(scene, con, true, false);
+    }
+    VOX_MUTEX_UNLOCK(scene->mutex);
+}
+
+JNIEXPORT void JNICALL Java_dev_ryanhcode_sable_physics_impl_vox3d_Vox3D_setKinematicContraptionMount(
+    JNIEnv *env, jclass clazz, jlong sceneHandle, jint id, jint mountId)
+{
+    (void)env; (void)clazz;
+    if (sceneHandle == 0) return;
+    Vox3DScene* scene = (Vox3DScene*)(uintptr_t)sceneHandle;
+
+    VOX_MUTEX_LOCK(scene->mutex);
+    KinematicContraption* con = find_contraption(scene, id);
+    if (con) {
+        if (con->mountId != mountId) {
+            con->mountId = mountId;
+            con->hasValidTransform = false;
+            sync_contraption_mount_filter(scene, con);
+        }
     }
     VOX_MUTEX_UNLOCK(scene->mutex);
 }
@@ -3402,19 +3626,7 @@ JNIEXPORT void JNICALL Java_dev_ryanhcode_sable_physics_impl_vox3d_Vox3D_setKine
             con->angularVelocity[i] = vel[i + 3];
         }
 
-        if (!con->ownsBody) {
-            SubLevelBody* mount = find_sublevel(scene, con->mountId);
-            if (!mount || !b3Body_IsValid(mount->bodyId) ||
-                !B3_ID_EQUALS(mount->bodyId, con->bodyId)) {
-                release_contraption(scene, con, true, true);
-            } else {
-                // A mounted collider's pose is relative to its parent, so its
-                // baked hull transforms must change whenever pose or COM does.
-                rebuild_contraption_shapes(con);
-            }
-        } else if (b3Body_IsValid(con->bodyId)) {
-            // The body is advanced to posePosition/poseRotation immediately
-            // before the next world step via b3Body_SetTargetTransform.
+        if (b3Body_IsValid(con->bodyId)) {
             if (centerChanged) rebuild_contraption_shapes(con);
         }
     }
@@ -4061,7 +4273,11 @@ JNIEXPORT void JNICALL Java_dev_ryanhcode_sable_physics_impl_vox3d_Vox3D_setWind
 
     VOX_MUTEX_LOCK(scene->mutex);
     scene->wind = (b3Vec3){ (float)wx, (float)wy, (float)wz };
-    scene->aeroDrag = (float)drag;
-    scene->aeroLift = (float)lift;
+    scene->aeroDrag = drag > 0.0 ? (float)drag : 0.5f;
+    scene->aeroLift = lift > 0.0 ? (float)lift : 80.0f;
+    if (b3World_IsValid(scene->worldId)) {
+        b3World_SetWind(scene->worldId, scene->wind);
+        b3World_SetAeroScales(scene->worldId, scene->aeroDrag, scene->aeroLift);
+    }
     VOX_MUTEX_UNLOCK(scene->mutex);
 }

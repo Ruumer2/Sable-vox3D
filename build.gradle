@@ -31,9 +31,17 @@ gradle.projectsEvaluated {
     }
 }
 
+tasks.register('buildAllNatives', Exec) {
+    group = 'build'
+    description = 'Builds multiplatform native binaries (Linux x86_64/aarch64, macOS x86_64/aarch64, Windows aarch64) using Zig/WSL.'
+    def scriptPath = file('native/build_all_natives.sh').absolutePath.replace('\\', '/')
+    def wslPath = scriptPath.replaceFirst('^([A-Za-z]):', { all, drive -> "/mnt/${drive.toLowerCase()}" })
+    commandLine 'wsl', '-d', 'Ubuntu-24.04', '--', 'bash', '-c', "bash '${wslPath}'"
+}
+
 tasks.register('releaseBuild') {
     group = 'build'
-    description = 'Builds the current native bridge before packaging both loader jars.'
-    dependsOn buildNativeRelease, ':fabric:build', ':neoforge:build'
+    description = 'Builds all native bridges before packaging both loader jars.'
+    dependsOn buildAllNatives, buildNativeRelease, ':fabric:build', ':neoforge:build'
 }
 

@@ -1,0 +1,14 @@
+{
+  "required": true,
+  "package": "dev.ryanhcode.sable.physics.impl.vox3d.mixin",
+  "compatibilityLevel": "JAVA_21",
+  "mixins": [
+    "BlockSubLevelLiftProviderMixin",
+    "ServerSubLevelMixin"
+  ],
+  "client": [],
+  "server": [],
+  "injectors": {
+    "defaultRequire": 1
+  }
+}

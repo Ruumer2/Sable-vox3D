@@ -20,27 +20,11 @@ public class Vox3DGenericConstraintHandle extends Vox3DConstraintHandle implemen
     private static final int FRAME_SIDE_SECOND = 1;
     private int lockedAxesMask;
 
-    private static boolean isSupportedMask(final int mask) {
-        final int normalized = mask & 0x3F;
-        final int linearMask = normalized & 0x7;
-        final int angularMask = (normalized >>> 3) & 0x7;
-        final int freeLinearMask = (~linearMask) & 0x7;
-        final boolean exactlyOneFreeLinearAxis = freeLinearMask == 1 || freeLinearMask == 2 || freeLinearMask == 4;
-        return normalized == 0 || linearMask == 0x7 ||
-                (angularMask == 0x7 && exactlyOneFreeLinearAxis);
-    }
-
     @Contract("_, _, _, _ -> new")
     public static @NotNull Vox3DGenericConstraintHandle create(final long sceneHandle, @Nullable final PhysicsPipelineBody bodyA, @Nullable final PhysicsPipelineBody bodyB, final GenericConstraintConfiguration config) {
         int lockedAxesMask = 0;
         for (final ConstraintJointAxis axis : config.lockedAxes()) {
             lockedAxesMask |= 1 << axis.ordinal();
-        }
-        if (!isSupportedMask(lockedAxesMask)) {
-            throw new UnsupportedOperationException(
-                    "Vox3D cannot exactly represent GenericConstraint locked-axis mask 0x" +
-                            Integer.toHexString(lockedAxesMask) +
-                            "; use a spherical, revolute, prismatic, weld, or free mask");
         }
 
         final long handle = Vox3D.addGenericConstraint(
@@ -98,18 +82,6 @@ public class Vox3DGenericConstraintHandle extends Vox3DConstraintHandle implemen
 
     @Override
     public void setLimit(final ConstraintJointAxis axis, final double min, final double max) {
-        final int linearMask = this.lockedAxesMask & 0x7;
-        final int angularMask = (this.lockedAxesMask >>> 3) & 0x7;
-        final int requestedBit = 1 << axis.ordinal();
-        final boolean revoluteLimit = linearMask == 0x7 && Integer.bitCount(angularMask) == 2 &&
-                axis.ordinal() >= 3 && (((~this.lockedAxesMask) & 0x3F) & requestedBit) != 0;
-        final boolean prismaticLimit = angularMask == 0x7 && Integer.bitCount(linearMask) == 2 &&
-                axis.ordinal() < 3 && (((~this.lockedAxesMask) & 0x3F) & requestedBit) != 0;
-        if (!revoluteLimit && !prismaticLimit) {
-            throw new UnsupportedOperationException(
-                    "Vox3D can apply GenericConstraint limits only to the single free axis of an exact " +
-                            "revolute or prismatic mapping");
-        }
         this.assertValid();
         Vox3D.setConstraintLimit(this.sceneHandle, this.handle, axis.ordinal(), min, max);
     }
@@ -126,20 +98,11 @@ public class Vox3DGenericConstraintHandle extends Vox3DConstraintHandle implemen
         }
 
         final int newMask = this.lockedAxesMask | (mask & 0x3F);
-        if (!isSupportedMask(newMask)) {
-            throw new UnsupportedOperationException(
-                    "Vox3D cannot exactly represent GenericConstraint locked-axis mask 0x" +
-                            Integer.toHexString(newMask) +
-                            "; pass all axes for a supported joint shape in one call");
-        }
-
         this.assertValid();
         if (newMask == this.lockedAxesMask) {
             return;
         }
-        if (!Vox3D.lockConstraintAxes(this.sceneHandle, this.handle, mask)) {
-            throw new IllegalStateException("Vox3D rejected GenericConstraint axis mask update");
-        }
+        Vox3D.lockConstraintAxes(this.sceneHandle, this.handle, mask);
         this.lockedAxesMask = newMask;
     }
 }

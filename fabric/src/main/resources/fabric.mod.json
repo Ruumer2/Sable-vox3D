@@ -15,6 +15,9 @@
       "dev.ryanhcode.sable.physics.impl.vox3d.fabric.SableVox3DFabric"
     ]
   },
+  "mixins": [
+    "sable_vox3d.mixins.json"
+  ],
   "depends": {
     "fabricloader": ">=${fabric_loader_version}",
     "minecraft": "${minecraft_version}",

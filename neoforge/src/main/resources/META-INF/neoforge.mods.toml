@@ -9,6 +9,9 @@ displayName="${mod_name}"
 authors="${mod_author}"
 description='''${description}'''
 
+[[mixins]]
+config="sable_vox3d.mixins.json"
+
 [[dependencies.${mod_id}]]
 modId="neoforge"
 type="required"

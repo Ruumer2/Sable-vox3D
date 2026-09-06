@@ -1,6 +1,7 @@
 package dev.ryanhcode.sable.physics.impl.vox3d.collider;
 
 import dev.ryanhcode.sable.api.block.BlockSubLevelCollisionShape;
+import dev.ryanhcode.sable.api.block.BlockSubLevelLiftProvider;
 import dev.ryanhcode.sable.api.block.BlockWithSubLevelCollisionCallback;
 import dev.ryanhcode.sable.api.physics.callback.BlockSubLevelCollisionCallback;
 import dev.ryanhcode.sable.api.physics.collider.SableCollisionContext;
@@ -10,9 +11,11 @@ import dev.ryanhcode.sable.physics.config.block_properties.PhysicsBlockPropertyH
 import dev.ryanhcode.sable.physics.impl.vox3d.Vox3D;
 import net.minecraft.Util;
 import net.minecraft.core.BlockPos;
+import net.minecraft.core.Direction;
 import net.minecraft.world.level.BlockGetter;
 import net.minecraft.world.level.block.Blocks;
 import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.level.block.state.properties.BlockStateProperties;
 import net.minecraft.world.phys.shapes.VoxelShape;
 import org.jetbrains.annotations.NotNull;
 import org.jetbrains.annotations.Nullable;
@@ -71,7 +74,61 @@ public class Vox3DVoxelColliderBakery {
             );
         });
 
+        if (isSail(childState)) {
+            final Direction normal = getSailNormal(childState);
+            final double nx = normal.getStepX();
+            final double ny = normal.getStepY();
+            final double nz = normal.getStepZ();
+
+            // Derive chord direction if explicitly oriented perpendicular to the normal
+            double cx = 0.0;
+            double cy = 0.0;
+            double cz = 0.0;
+
+            if (childState.hasProperty(BlockStateProperties.HORIZONTAL_FACING)) {
+                final Direction facing = childState.getValue(BlockStateProperties.HORIZONTAL_FACING);
+                if (facing != normal && facing != normal.getOpposite()) {
+                    cx = facing.getStepX();
+                    cy = facing.getStepY();
+                    cz = facing.getStepZ();
+                }
+            } else if (childState.hasProperty(BlockStateProperties.FACING)) {
+                final Direction facing = childState.getValue(BlockStateProperties.FACING);
+                if (facing != normal && facing != normal.getOpposite()) {
+                    cx = facing.getStepX();
+                    cy = facing.getStepY();
+                    cz = facing.getStepZ();
+                }
+            }
+
+            // Normal sails use symmetric airfoil profile (flat membrane canvas).
+            // If chord is (0, 0, 0), Box3D's adaptive in-plane chord automatically aligns
+            // with oncoming airflow across all 360 degrees of flight.
+            entry.setAirfoil(Vox3DVoxelColliderData.AIRFOIL_SYMMETRIC, cx, cy, cz, nx, ny, nz, 1.0, 6.0);
+        }
+
         return entry;
+    }
+
+    private static boolean isSail(final BlockState state) {
+        if (state.getBlock() instanceof BlockSubLevelLiftProvider) {
+            return true;
+        }
+        final String name = state.getBlock().getDescriptionId().toLowerCase();
+        return name.contains("sail");
+    }
+
+    private static Direction getSailNormal(final BlockState state) {
+        if (state.getBlock() instanceof final BlockSubLevelLiftProvider liftProvider) {
+            return liftProvider.sable$getNormal(state);
+        }
+        if (state.hasProperty(BlockStateProperties.FACING)) {
+            return state.getValue(BlockStateProperties.FACING);
+        }
+        if (state.hasProperty(BlockStateProperties.HORIZONTAL_FACING)) {
+            return state.getValue(BlockStateProperties.HORIZONTAL_FACING);
+        }
+        return Direction.UP;
     }
 
     public @Nullable Vox3DVoxelColliderData getPhysicsDataForBlock(final BlockState state) {

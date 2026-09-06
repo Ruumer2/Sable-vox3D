@@ -3,6 +3,9 @@ package dev.ryanhcode.sable.physics.impl.vox3d;
 import dev.ryanhcode.sable.api.physics.PhysicsPipelineBody;
 import dev.ryanhcode.sable.api.physics.callback.BlockSubLevelCollisionCallback;
 import dev.ryanhcode.sable.api.physics.mass.MassData;
+import dev.ryanhcode.sable.physics.callback.BeehiveBlockCallback;
+import dev.ryanhcode.sable.physics.callback.BellBlockCallback;
+import dev.ryanhcode.sable.physics.callback.FragileBlockCallback;
 import dev.ryanhcode.sable.physics.impl.vox3d.collider.Vox3DVoxelColliderData;
 import org.jetbrains.annotations.Nullable;
 import org.joml.Matrix3dc;
@@ -149,8 +152,16 @@ public final class Vox3D {
     }
 
     public static Vox3DVoxelColliderData createVoxelColliderEntry(final double frictionMultiplier, final double volume, final double restitution, final boolean isFluid, final BlockSubLevelCollisionCallback contactEvents) {
+        boolean removesCollision = false;
+        double triggerVelocity = 0.0;
+        if (contactEvents instanceof FragileBlockCallback fragile) {
+            triggerVelocity = fragile.getTriggerVelocity();
+            if (!(contactEvents instanceof BeehiveBlockCallback) && !(contactEvents instanceof BellBlockCallback)) {
+                removesCollision = true;
+            }
+        }
         return new Vox3DVoxelColliderData(
-                newVoxelCollider(frictionMultiplier, volume, restitution, isFluid, contactEvents),
+                newVoxelCollider(frictionMultiplier, volume, restitution, isFluid, contactEvents, removesCollision, triggerVelocity),
                 isFluid,
                 contactEvents
         );
@@ -183,6 +194,7 @@ public final class Vox3D {
 
     public static native void createKinematicContraption(long sceneHandle, int mountId, int id, double[] pose);
     public static native void removeKinematicContraption(long sceneHandle, int id);
+    public static native void setKinematicContraptionMount(long sceneHandle, int id, int mountId);
     public static native void setKinematicContraptionTransform(long sceneHandle, int id, double[] centerOfMass, double[] pose, double[] velocity);
     public static native void addKinematicContraptionChunkSection(long sceneHandle, int id, int cx, int cy, int cz, int[] chunkData);
 
@@ -190,9 +202,10 @@ public final class Vox3D {
     public static native void removeChunk(long sceneHandle, int cx, int cy, int cz, boolean global);
     public static native void changeBlock(long sceneHandle, int bx, int by, int bz, int packedValue);
 
-    public static native int newVoxelCollider(double frictionMultiplier, double volume, double restitution, boolean isFluid, BlockSubLevelCollisionCallback contactEvents);
+    public static native int newVoxelCollider(double frictionMultiplier, double volume, double restitution, boolean isFluid, BlockSubLevelCollisionCallback contactEvents, boolean removesCollision, double triggerVelocity);
     public static native void addVoxelColliderBox(int index, double[] bounds);
     public static native void clearVoxelColliderBoxes(int index);
+    public static native void setVoxelColliderAirfoil(int index, int airfoilType, double chordX, double chordY, double chordZ, double upX, double upY, double upZ, double area, double aspectRatio);
 
     public static native void createBox(long sceneHandle, int id, double mass, double hx, double hy, double hz, double[] pose);
     public static native void removeBox(long sceneHandle, int id);

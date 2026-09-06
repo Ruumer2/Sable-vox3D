@@ -105,6 +105,7 @@ public class Vox3DPhysicsPipeline implements PhysicsPipeline {
             final double gy = gravity != null ? gravity.y() : -9.81;
             final double gz = gravity != null ? gravity.z() : 0.0;
             this.scene = new Vox3DPhysicsScene(Vox3D.initialize(gx, gy, gz, universalDrag));
+            Vox3D.setWind(this.scene.handle(), 0.0, 0.0, 0.0, 1.0, 1.0);
             Sable.LOGGER.info("Initialized Sable Vox3D physics scene with handle: {}", this.scene.handle());
         } catch (final LinkageError e) {
             Sable.LOGGER.error("Sable has failed to link with native Vox3D physics library", e);
@@ -196,20 +197,28 @@ public class Vox3DPhysicsPipeline implements PhysicsPipeline {
         }
 
         final int id = this.getNextRuntimeID();
+        final SubLevel mountSubLevel = Sable.HELPER.getContaining(this.level, contraption.sable$getPosition());
+        final int mountId = mountSubLevel != null ? Vox3D.getID((ServerSubLevel) mountSubLevel) : -1;
+
+        final Vector3dc mountCenterOfMass = mountSubLevel != null
+                ? ((ServerSubLevel) mountSubLevel).getMassTracker().getCenterOfMass()
+                : null;
+        final Vector3dc parentCenterOfMass = mountCenterOfMass != null ? mountCenterOfMass : JOMLConversion.ZERO;
+
         // The native create call does not receive the contraption COM. Use an
         // infinite position sentinel so the first pose update is never skipped,
         // including for an identity-oriented contraption placed at the origin.
         this.activeContraptions.put(contraption, new TrackedKinematicContraption(
                 new Vector3d(Double.POSITIVE_INFINITY, 0.0, 0.0), new Quaterniond(),
-                new Vector3d(), new Vector3d(), id));
-
-        final SubLevel mountSubLevel = Sable.HELPER.getContaining(this.level, contraption.sable$getPosition());
-        final int mountId = mountSubLevel != null ? Vox3D.getID((ServerSubLevel) mountSubLevel) : -1;
+                new Vector3d(), new Vector3d(), id, mountId));
 
         final BoundingBox3i localBounds = new BoundingBox3i();
         contraption.sable$getLocalBounds(localBounds);
 
-        final Vector3dc pos = contraption.sable$getPosition();
+        final Vector3d pos = new Vector3d(contraption.sable$getPosition());
+        if (mountSubLevel != null) {
+            pos.sub(parentCenterOfMass);
+        }
         final Quaterniond rot = contraption.sable$getOrientation();
         final double[] pose = {pos.x(), pos.y(), pos.z(), rot.x(), rot.y(), rot.z(), rot.w()};
 
@@ -487,6 +496,12 @@ public class Vox3DPhysicsPipeline implements PhysicsPipeline {
         final TrackedKinematicContraption trackedContraption = this.activeContraptions.get(contraption);
 
         final SubLevel mountSubLevel = Sable.HELPER.getContaining(this.level, contraption.sable$getPosition());
+        final int currentMountId = mountSubLevel != null ? Vox3D.getID((ServerSubLevel) mountSubLevel) : -1;
+        if (currentMountId != trackedContraption.mountId()) {
+            trackedContraption.setMountId(currentMountId);
+            Vox3D.setKinematicContraptionMount(this.scene.handle(), trackedContraption.id(), currentMountId);
+        }
+
         final Vector3dc mountCenterOfMass = mountSubLevel != null
                 ? ((ServerSubLevel) mountSubLevel).getMassTracker().getCenterOfMass()
                 : null;
@@ -506,6 +521,13 @@ public class Vox3DPhysicsPipeline implements PhysicsPipeline {
         rot.transformInverse(linVel);
         rot.transformInverse(angVel);
 
+        if (linVel.lengthSquared() > 400.0) {
+            linVel.zero();
+        }
+        if (angVel.lengthSquared() > 400.0) {
+            angVel.zero();
+        }
+
         pos.sub(parentCenterOfMass);
 
         if (
@@ -515,7 +537,7 @@ public class Vox3DPhysicsPipeline implements PhysicsPipeline {
                         rot.div(trackedContraption.lastUploadedOrientation(), new Quaterniond()).angle() > ANGULAR_THRESHOLD
         ) {
             final MassTracker massTracker = contraption.sable$getMassTracker();
-            final Vector3dc centerOfMass = massTracker.getCenterOfMass();
+            final Vector3dc centerOfMass = massTracker != null ? massTracker.getCenterOfMass() : null;
 
             final double[] centerOfMassArray = new double[]{centerOfMass != null ? centerOfMass.x() : 0.0, centerOfMass != null ? centerOfMass.y() : 0.0, centerOfMass != null ? centerOfMass.z() : 0.0};
             final double[] poseArray = {pos.x(), pos.y(), pos.z(), rot.x(), rot.y(), rot.z(), rot.w()};
@@ -612,7 +634,31 @@ public class Vox3DPhysicsPipeline implements PhysicsPipeline {
         }
     }
 
-    private record TrackedKinematicContraption(Vector3d lastUploadedPosition, Quaterniond lastUploadedOrientation,
-                                               Vector3d lastUploadedLinVel, Vector3d lastUploadedAngVel, int id) {
+    private static final class TrackedKinematicContraption {
+        private final Vector3d lastUploadedPosition;
+        private final Quaterniond lastUploadedOrientation;
+        private final Vector3d lastUploadedLinVel;
+        private final Vector3d lastUploadedAngVel;
+        private final int id;
+        private int mountId;
+
+        TrackedKinematicContraption(final Vector3d lastUploadedPosition, final Quaterniond lastUploadedOrientation,
+                                    final Vector3d lastUploadedLinVel, final Vector3d lastUploadedAngVel,
+                                    final int id, final int mountId) {
+            this.lastUploadedPosition = lastUploadedPosition;
+            this.lastUploadedOrientation = lastUploadedOrientation;
+            this.lastUploadedLinVel = lastUploadedLinVel;
+            this.lastUploadedAngVel = lastUploadedAngVel;
+            this.id = id;
+            this.mountId = mountId;
+        }
+
+        public Vector3d lastUploadedPosition() { return this.lastUploadedPosition; }
+        public Quaterniond lastUploadedOrientation() { return this.lastUploadedOrientation; }
+        public Vector3d lastUploadedLinVel() { return this.lastUploadedLinVel; }
+        public Vector3d lastUploadedAngVel() { return this.lastUploadedAngVel; }
+        public int id() { return this.id; }
+        public int mountId() { return this.mountId; }
+        public void setMountId(final int mountId) { this.mountId = mountId; }
     }
 }
